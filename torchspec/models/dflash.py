@@ -58,6 +58,7 @@ def _create_dflash_mask_mod(
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    sliding_window: Optional[int] = None,
 ):
     """Create a mask_mod function for DFlash block-causal attention.
 
@@ -69,6 +70,10 @@ def _create_dflash_mask_mod(
       2. Intra-block attention is bidirectional (per SpecForge PR #427)
       3. Different blocks are invisible to each other
       4. Invalid blocks (block_keep_mask=False) see nothing
+      5. If ``sliding_window`` is set, context visibility is additionally
+         limited to KV positions within the window of the query's RoPE
+         position (anchor + offset-in-block), matching sliding-attention
+         layers at serving time. Intra-block attention stays unrestricted.
     """
     num_anchors = anchor_positions.shape[1]
 
@@ -78,6 +83,9 @@ def _create_dflash_mask_mod(
 
         is_context = kv_idx < ctx_len
         mask_context = is_context & (kv_idx < anchor_pos)
+        if sliding_window is not None:
+            q_pos = anchor_pos + (q_idx % block_size)
+            mask_context = mask_context & (q_pos - kv_idx < sliding_window)
 
         is_draft = kv_idx >= ctx_len
         kv_block_id = (kv_idx - ctx_len) // block_size
@@ -86,7 +94,10 @@ def _create_dflash_mask_mod(
         is_valid_block = block_keep_mask[b, q_block_id]
         return (mask_context | mask_draft) & is_valid_block
 
-    dflash_mask_mod.__name__ = f"dflash_mask_A{num_anchors}_B{block_size}_C{ctx_len}"
+    window_tag = f"_W{sliding_window}" if sliding_window is not None else ""
+    dflash_mask_mod.__name__ = (
+        f"dflash_mask_A{num_anchors}_B{block_size}_C{ctx_len}{window_tag}"
+    )
     return dflash_mask_mod
 
 
@@ -287,7 +298,15 @@ class DFlashModel(nn.Module):
         draft_len = n_blocks * self.block_size
         kv_len = seq_len + draft_len
 
+        draft_config = getattr(self.draft_model, "config", None)
+        layer_types = getattr(draft_config, "layer_types", None)
+        sliding_window = getattr(draft_config, "sliding_window", None)
+        needs_sliding_mask = bool(
+            sliding_window and layer_types and "sliding_attention" in layer_types
+        )
+
         block_mask = None
+        block_mask_sliding = None
         if device.type == "cuda":
             mask_mod = _create_dflash_mask_mod(
                 anchor_positions=anchor_positions,
@@ -303,8 +322,27 @@ class DFlashModel(nn.Module):
                 KV_LEN=kv_len,
                 device=device,
             )
+            if needs_sliding_mask:
+                sliding_mask_mod = _create_dflash_mask_mod(
+                    anchor_positions=anchor_positions,
+                    block_keep_mask=block_keep_mask,
+                    ctx_len=seq_len,
+                    block_size=self.block_size,
+                    sliding_window=int(sliding_window),
+                )
+                block_mask_sliding = compile_friendly_create_block_mask(
+                    mask_mod=sliding_mask_mod,
+                    B=bsz,
+                    H=None,
+                    Q_LEN=draft_len,
+                    KV_LEN=kv_len,
+                    device=device,
+                )
 
         # 6. Draft model forward — pass embeddings directly
+        extra_kwargs = {}
+        if block_mask_sliding is not None:
+            extra_kwargs["block_mask_sliding"] = block_mask_sliding
         draft_hidden = self.draft_model(
             draft_input_ids=None,
             context_feature=context_feature,
@@ -312,6 +350,7 @@ class DFlashModel(nn.Module):
             context_position_ids=context_position_ids,
             block_mask=block_mask,
             noise_embedding=noise_embedding,
+            **extra_kwargs,
         )
 
         return draft_hidden, anchor_positions, block_keep_mask, n_blocks

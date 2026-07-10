@@ -61,6 +61,8 @@ class DFlashConfig(PretrainedConfig):
         target_layer_ids: Optional[List[int]] = None,
         mask_token_id: int = 151669,
         tie_word_embeddings: bool = False,
+        layer_types: Optional[List[str]] = None,
+        sliding_window: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -78,6 +80,8 @@ class DFlashConfig(PretrainedConfig):
         self.target_num_hidden_layers = target_num_hidden_layers
         self.target_layer_ids = target_layer_ids
         self.mask_token_id = mask_token_id
+        self.layer_types = layer_types
+        self.sliding_window = sliding_window
 
 
 class DFlashRMSNorm(nn.Module):
@@ -387,6 +391,19 @@ class DFlashDraftModel(PreTrainedModel):
         # Decoder layers
         self.layers = nn.ModuleList([DFlashDecoderLayer(config) for _ in range(self.num_layers)])
 
+        # Per-layer attention types (e.g. ["sliding_attention", ..., "full_attention"]).
+        # Sliding layers use a window-constrained mask when the training wrapper
+        # provides one; otherwise everything falls back to the full mask.
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            layer_types = ["full_attention"] * self.num_layers
+        if len(layer_types) != self.num_layers:
+            raise ValueError(
+                f"config.layer_types has {len(layer_types)} entries but the model "
+                f"has {self.num_layers} layers"
+            )
+        self.layer_types = list(layer_types)
+
         # Final norm
         self.final_norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -411,6 +428,7 @@ class DFlashDraftModel(PreTrainedModel):
         context_position_ids: torch.Tensor,
         block_mask=None,
         noise_embedding: Optional[torch.Tensor] = None,
+        block_mask_sliding=None,
     ) -> torch.Tensor:
         """Forward pass through draft model.
 
@@ -422,6 +440,8 @@ class DFlashDraftModel(PreTrainedModel):
             context_position_ids: [B, ctx_len]
             block_mask: FlexAttention BlockMask
             noise_embedding: [B, draft_len, D] — pre-computed embeddings (from training wrapper)
+            block_mask_sliding: optional window-constrained BlockMask used by
+                layers whose ``config.layer_types`` entry is "sliding_attention"
 
         Returns:
             hidden_states: [B, draft_len, D] — pre-norm hidden states
@@ -431,13 +451,16 @@ class DFlashDraftModel(PreTrainedModel):
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
-        for layer in self.layers:
+        for layer, layer_type in zip(self.layers, self.layer_types):
+            layer_mask = block_mask
+            if layer_type == "sliding_attention" and block_mask_sliding is not None:
+                layer_mask = block_mask_sliding
             draft_hidden = layer(
                 draft_hidden=draft_hidden,
                 context_hidden=context_feature,
                 draft_position_ids=draft_position_ids,
                 context_position_ids=context_position_ids,
-                block_mask=block_mask,
+                block_mask=layer_mask,
             )
 
         return self.final_norm(draft_hidden)

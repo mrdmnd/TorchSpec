@@ -165,6 +165,15 @@ def main():
     ap.add_argument("--config", required=True, help="Target draft model config.json (e.g. DSpark)")
     ap.add_argument("--output", required=True, help="Output init dir (use as training.load_path)")
     ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument(
+        "--embed-from",
+        default=None,
+        help="Target model path/repo to copy frozen embed_tokens from. Without "
+        "this, embed_tokens stays randomly initialized in the init checkpoint "
+        "and silently overwrites the trainer's target-loaded embeddings when "
+        "the warm start is loaded (checkpoint.load runs after load_embedding).",
+    )
+    ap.add_argument("--embedding-key", default="model.embed_tokens.weight")
     args = ap.parse_args()
 
     dtype = getattr(torch, args.dtype)
@@ -182,6 +191,13 @@ def main():
     remapped = _remap_to_model(raw, model_keys)
     matched = {k: v.to(dtype) for k, v in remapped.items() if k in model_keys}
     result = model.load_state_dict(matched, strict=False)
+
+    if args.embed_from and hasattr(model, "load_embedding"):
+        print(f"loading embed_tokens from {args.embed_from} ({args.embedding_key})")
+        model.load_embedding(args.embed_from, embedding_key=args.embedding_key)
+        result.missing_keys[:] = [
+            k for k in result.missing_keys if not k.startswith("embed_tokens.")
+        ]
 
     ignored = sorted(set(remapped) - model_keys)
     print(f"source: {src}")
