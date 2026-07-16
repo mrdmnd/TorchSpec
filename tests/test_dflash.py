@@ -1523,5 +1523,114 @@ class TestDFlashL1Loss(unittest.TestCase):
         self.assertNotAlmostEqual(run(1.0, 0.0), run(1.0, 0.9), places=4)
 
 
+class TestYarnRotaryEmbedding(unittest.TestCase):
+    """DFlashRotaryEmbedding yarn scaling must match SGLang's serving-side
+    YaRNScalingRotaryEmbedding (which sglang applies to any DFlash draft
+    checkpoint whose config carries rope_scaling, e.g.
+    nvidia/Kimi-K2.7-Code-DFlash)."""
+
+    # nvidia/Kimi-K2.7-Code-DFlash config.json rope parameters.
+    KIMI_ROPE_SCALING = {
+        "rope_type": "yarn",
+        "type": "yarn",
+        "factor": 32.0,
+        "original_max_position_embeddings": 4096,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+    }
+
+    def _sglang_reference(self, dim, base, rope_scaling, positions):
+        """Independent re-derivation of sglang's YaRNScalingRotaryEmbedding
+        cos/sin (yarn.py at the pinned base commit)."""
+        scale = rope_scaling["factor"]
+        orig_max = rope_scaling["original_max_position_embeddings"]
+        beta_fast, beta_slow = rope_scaling["beta_fast"], rope_scaling["beta_slow"]
+
+        def correction_dim(num_rot):
+            return (dim * math.log(orig_max / (num_rot * 2 * math.pi))) / (2 * math.log(base))
+
+        low = max(math.floor(correction_dim(beta_fast)), 0)
+        high = min(math.ceil(correction_dim(beta_slow)), dim - 1)
+        pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        ramp = torch.clamp(
+            (torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low), 0, 1
+        )
+        inv_freq = (1.0 / (scale * pos_freqs)) * ramp + (1.0 / pos_freqs) * (1 - ramp)
+        mscale = 0.1 * math.log(scale) + 1.0
+        freqs = torch.einsum("i,j->ij", positions.float(), inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos() * mscale, emb.sin() * mscale
+
+    def test_yarn_matches_sglang_reference(self):
+        from torchspec.models.draft.dflash import DFlashRotaryEmbedding
+
+        dim, base = 128, 50000.0
+        rope = DFlashRotaryEmbedding(
+            dim,
+            max_position_embeddings=131072,
+            base=base,
+            rope_scaling=self.KIMI_ROPE_SCALING,
+        )
+        positions = torch.tensor([0, 1, 4095, 4096, 20000, 65536])
+        cos, sin = rope(torch.zeros(1, dtype=torch.float32), seq_len=65537)
+        ref_cos, ref_sin = self._sglang_reference(dim, base, self.KIMI_ROPE_SCALING, positions)
+        torch.testing.assert_close(
+            cos[0, 0, positions, :], ref_cos, rtol=1e-5, atol=1e-5
+        )
+        torch.testing.assert_close(
+            sin[0, 0, positions, :], ref_sin, rtol=1e-5, atol=1e-5
+        )
+
+    def test_yarn_differs_from_plain_rope_past_original_context(self):
+        from torchspec.models.draft.dflash import DFlashRotaryEmbedding
+
+        dim, base = 128, 50000.0
+        plain = DFlashRotaryEmbedding(dim, max_position_embeddings=131072, base=base)
+        yarn = DFlashRotaryEmbedding(
+            dim,
+            max_position_embeddings=131072,
+            base=base,
+            rope_scaling=self.KIMI_ROPE_SCALING,
+        )
+        cos_p, _ = plain(torch.zeros(1), seq_len=20001)
+        cos_y, _ = yarn(torch.zeros(1), seq_len=20001)
+        # Harness conversations run ~20k tokens; without yarn those positions
+        # would be rotated differently at train time than at serving time.
+        self.assertGreater((cos_p[0, 0, 20000] - cos_y[0, 0, 20000]).abs().max().item(), 0.01)
+
+    def test_no_scaling_is_unchanged_plain_rope(self):
+        from torchspec.models.draft.dflash import DFlashRotaryEmbedding
+
+        rope = DFlashRotaryEmbedding(64, max_position_embeddings=512, base=10000.0)
+        self.assertEqual(rope.mscale, 1.0)
+        cos, sin = rope(torch.zeros(1), seq_len=10)
+        t = torch.arange(10, dtype=torch.float32)
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 64, 2).float() / 64))
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        torch.testing.assert_close(cos[0, 0], emb.cos(), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(sin[0, 0], emb.sin(), rtol=1e-6, atol=1e-6)
+
+    def test_unsupported_scaling_type_raises(self):
+        from torchspec.models.draft.dflash import DFlashRotaryEmbedding
+
+        with self.assertRaises(NotImplementedError):
+            DFlashRotaryEmbedding(
+                64,
+                max_position_embeddings=512,
+                base=10000.0,
+                rope_scaling={"rope_type": "llama3", "factor": 8.0},
+            )
+
+    def test_attention_picks_up_config_rope_scaling(self):
+        config = _make_config()
+        config.rope_scaling = dict(self.KIMI_ROPE_SCALING)
+        model = DFlashDraftModel(config)
+        rotary = model.layers[0].self_attn.rotary_emb
+        self.assertGreater(rotary.mscale, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

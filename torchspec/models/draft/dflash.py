@@ -28,6 +28,7 @@ Architecture overview:
 """
 
 import json
+import math
 import os
 from typing import List, Optional, Tuple
 
@@ -63,6 +64,7 @@ class DFlashConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         layer_types: Optional[List[str]] = None,
         sliding_window: Optional[int] = None,
+        rope_scaling: Optional[dict] = None,
         **kwargs,
     ):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
@@ -82,6 +84,7 @@ class DFlashConfig(PretrainedConfig):
         self.mask_token_id = mask_token_id
         self.layer_types = layer_types
         self.sliding_window = sliding_window
+        self.rope_scaling = rope_scaling
 
 
 class DFlashRMSNorm(nn.Module):
@@ -98,13 +101,108 @@ class DFlashRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
+# --- YaRN helpers (ported from sglang.srt.layers.rotary_embedding.yarn so the
+# --- training-side rotation matches what SGLang serves; credits Peng et al.,
+# --- github.com/jquesnelle/yarn) ------------------------------------------------
+
+
+def _yarn_find_correction_dim(
+    num_rotations: float, dim: int, base: float, max_position_embeddings: int
+) -> float:
+    return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
+        2 * math.log(base)
+    )
+
+
+def _yarn_find_correction_range(
+    low_rot: float, high_rot: float, dim: int, base: float, max_position_embeddings: int
+) -> Tuple[int, int]:
+    low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
+    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
+    return max(low, 0), min(high, dim - 1)
+
+
+def _yarn_linear_ramp_mask(low: float, high: float, dim: int) -> torch.Tensor:
+    if low == high:
+        high += 0.001  # Prevent singularity
+    linear_func = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
+    return torch.clamp(linear_func, 0, 1)
+
+
+def _yarn_get_mscale(scale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * math.log(scale) + 1.0
+
+
+def _yarn_inv_freq(
+    dim: int,
+    base: float,
+    scaling_factor: float,
+    original_max_position: int,
+    beta_fast: float,
+    beta_slow: float,
+    extrapolation_factor: float,
+) -> torch.Tensor:
+    pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+    low, high = _yarn_find_correction_range(
+        beta_fast, beta_slow, dim, base, original_max_position
+    )
+    inv_freq_mask = (1 - _yarn_linear_ramp_mask(low, high, dim // 2)) * extrapolation_factor
+    return inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
+
+
 class DFlashRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_position_embeddings: int = 32768, base: float = 10000.0):
+    """Plain RoPE, optionally with YaRN scaling.
+
+    ``rope_scaling`` follows the HF config convention ({"rope_type": "yarn",
+    "factor": ..., "original_max_position_embeddings": ...}); the yarn math
+    mirrors SGLang's YaRNScalingRotaryEmbedding, which is what the serving
+    stack applies to DFlash draft checkpoints whose config carries
+    rope_scaling (e.g. nvidia/Kimi-K2.7-Code-DFlash). Keys sglang ignores for
+    plain "yarn" (mscale, mscale_all_dim) are ignored here too.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int = 32768,
+        base: float = 10000.0,
+        rope_scaling: Optional[dict] = None,
+    ):
         super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        self.mscale = 1.0
+
+        scaling_type = None
+        if rope_scaling:
+            scaling_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+        if scaling_type is None:
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        elif scaling_type == "yarn":
+            scaling_factor = float(rope_scaling.get("factor", 1.0))
+            original_max_position = int(
+                rope_scaling.get("original_max_position_embeddings", max_position_embeddings)
+            )
+            attn_factor = float(rope_scaling.get("attn_factor", 1.0))
+            inv_freq = _yarn_inv_freq(
+                dim=self.dim,
+                base=self.base,
+                scaling_factor=scaling_factor,
+                original_max_position=original_max_position,
+                beta_fast=float(rope_scaling.get("beta_fast", 32)),
+                beta_slow=float(rope_scaling.get("beta_slow", 1)),
+                extrapolation_factor=float(rope_scaling.get("extrapolation_factor", 1.0)),
+            )
+            self.mscale = float(_yarn_get_mscale(scaling_factor) * attn_factor)
+        else:
+            raise NotImplementedError(
+                f"rope_scaling type {scaling_type!r} is not supported for DFlash training"
+            )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         # +20 buffer avoids cache rebuild if sequences slightly exceed the configured limit.
         self._set_cos_sin_cache(max_position_embeddings + 20, self.inv_freq.device, torch.float32)
@@ -114,8 +212,10 @@ class DFlashRotaryEmbedding(nn.Module):
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.einsum("i,j->ij", t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False)
+        cos = emb.cos() * self.mscale
+        sin = emb.sin() * self.mscale
+        self.register_buffer("cos_cached", cos[None, None, :, :].to(dtype), persistent=False)
+        self.register_buffer("sin_cached", sin[None, None, :, :].to(dtype), persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq_len and seq_len > self.max_seq_len_cached:
@@ -192,6 +292,7 @@ class DFlashAttention(nn.Module):
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=getattr(config, "rope_theta", 10000.0),
+            rope_scaling=getattr(config, "rope_scaling", None),
         )
 
     def forward(
