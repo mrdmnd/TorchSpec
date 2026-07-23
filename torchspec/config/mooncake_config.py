@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from typing import Tuple
@@ -219,6 +220,22 @@ class MooncakeConfig:
             # Mooncake's TCP-only memcpy fast path can segfault in same-host
             # multi-process get paths. Preserve an explicit user override.
             os.environ["MC_STORE_MEMCPY"] = "0"
+
+        # Bind the transfer engine's RPC/data listener to the same address we
+        # register in the metadata server. Without this Mooncake auto-selects
+        # the first active interface, which on multi-homed hosts (e.g. Modal
+        # cluster containers) can be a NAT'd interface unreachable from other
+        # nodes, so cross-node transfers fail with "No route to host". See
+        # https://github.com/kvcache-ai/Mooncake/issues/1938. Preserve an
+        # explicit user override, and skip non-IP hostnames (bind needs an
+        # address).
+        if "MC_TCP_BIND_ADDRESS" not in os.environ:
+            try:
+                bind_addr = ipaddress.ip_address(self.local_hostname)
+            except ValueError:
+                bind_addr = None
+            if bind_addr is not None and not bind_addr.is_loopback:
+                os.environ["MC_TCP_BIND_ADDRESS"] = self.local_hostname
 
     @classmethod
     def from_env(cls) -> "MooncakeConfig":
