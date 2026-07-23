@@ -33,7 +33,6 @@ MRV2, CUDA graphs, and ``torch.compile``.
 
 import gc
 import os
-import socket
 from typing import Any
 
 import ray
@@ -105,11 +104,13 @@ class VllmEngine(InferenceEngine, RayActor):
         self._mooncake_config = mooncake_config
 
         if mooncake_config is not None:
+            # Use the Ray node IP (the address this node registered with the
+            # Ray cluster) so peers on other nodes can reach our Mooncake
+            # segment. Probing the default route (UDP connect to 8.8.8.8)
+            # picks the NAT'd egress interface on multi-homed hosts (e.g.
+            # Modal containers), which is not routable from other nodes.
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
+                local_ip = self.get_node_ip()
             except Exception:
                 local_ip = "localhost"
                 logger.warning(
